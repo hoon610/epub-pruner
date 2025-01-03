@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "module": "CommonJS",
+    "noImplicitReturns": true,
+    "outDir": "build",
+    "sourceMap": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "target": "ES2020",
+    "types": [
+      "node"
+    ],
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "src/": [
+        "./src/"
+      ],
+    },
+    "allowSyntheticDefaultImports": true,
+    "moduleResolution": "Node",
+  },
+  "include": [
+    "src",
+    "./env.d.ts"
+  ],
+}
