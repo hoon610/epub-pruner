@@ -1,335 +1,46 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
-import { JSDOM } from 'jsdom';
-import sanitizeFilename from 'sanitize-filename';
+import { INPUT_DIR, OUTPUT_DIR } from './config/constants';
+import { validateEpubPath } from './utils/validation';
+import { initializeEpub } from './services/epub-initializer';
+import { processChaptersInBatches } from './services/chapter-processor';
+import { writeFiles } from './services/file-writer';
+import type { ProcessingProgress } from './types/interfaces';
 
-const EPub = require('epub');
-
-// Type definitions
-interface EPubMetadata {
-  creator: string;
-  creatorFileAs: string;
-  title: string;
-  language: string;
-  subject: string;
-  date: string;
-  description: string;
-}
-
-interface EPubChapter {
-  id: string;
-  title?: string;
-  href?: string;
-}
-
-interface EPubTocElement {
-  level: number;
-  order: number;
-  title: string;
-  href: string;
-}
-
-interface EPub {
-  metadata: EPubMetadata;
-  flow: EPubChapter[];
-  toc: EPubTocElement[];
-  parse(callback: (err?: Error) => void): void;
-  getChapter(chapterId: string, callback: (err: Error | null, text?: string) => void): void;
-  getChapterRaw(chapterId: string, callback: (err: Error | null, text?: string) => void): void;
-  getImage(imageId: string, callback: (err: Error | null, data?: Buffer, mimeType?: string) => void): void;
-  getFile(fileId: string, callback: (err: Error | null, data?: Buffer, mimeType?: string) => void): void;
-  on(event: 'end' | 'error', callback: (error?: Error) => void): void;
-}
-
-interface ChapterInfo {
-  id: string;
-  title: string;
-  content: string;
-  rawContent: string;
-  wordCount: number;
-  charCount: number;
-  paragraphCount: number;
-  position: number;
-  fileName: string;
-  images: ImageInfo[];
-}
-
-interface ImageInfo {
-  id: string;
-  fileName: string;
-  mimeType: string;
-  size: number;
-}
-
-interface ChapterMetadata {
-  id: string;
-  title: string;
-  wordCount: number;
-  charCount: number;
-  paragraphCount: number;
-  position: number;
-  fileName: string;
-  extractedDate: string;
-  images: ImageInfo[];
-}
-
-interface ProcessingProgress {
-  currentChapter: number;
-  totalChapters: number;
-  chapterTitle: string;
-  status: 'processing' | 'extracting-images' | 'writing-files';
-}
-
-// Constants
-const INPUT_DIR = path.join(__dirname, '..', 'input');
-const OUTPUT_DIR = path.join(__dirname, '..', 'output');
-const IMAGES_DIR = path.join(OUTPUT_DIR, 'images');
-
-// Utility functions
-const initializeEpub = (epubPath: string): Promise<EPub> => {
-  const epubInstance = new EPub(epubPath, '/images/', '/chapters/');
-
-  return new Promise((resolve, reject) => {
-    epubInstance.on('end', () => {
-      resolve(epubInstance);
-    });
-
-    epubInstance.on('error', reject);
-    epubInstance.parse();
-  });
-};
-
-const validateEpubPath = async (epubPath: string): Promise<boolean> => {
-  try {
-    const stats = await fs.stat(epubPath);
-    return stats.isFile() && path.extname(epubPath).toLowerCase() === '.epub';
-  } catch {
-    return false;
-  }
-};
-
-const validateChapterContent = (content: string): boolean => {
-  if (!content?.trim()) return false;
-  if (content.length < 10) return false;
-  return true;
-};
-
-const extractImages = async (
-  epub: EPub,
-  content: string,
-  chapterTitle: string,
-): Promise<ImageInfo[]> => {
-  const dom = new JSDOM(content);
-  const images = Array.from(dom.window.document.querySelectorAll('img'));
-  const imageInfos: ImageInfo[] = [];
-
-  for (const img of images) {
-    const imgId = img.getAttribute('id');
-    if (imgId) {
-      try {
-        const imgData = await new Promise<{ data: Buffer; mimeType: string }>((resolve, reject) => {
-          epub.getImage(imgId, (err, data, mimeType) => {
-            if (err) reject(err);
-            else if (data && mimeType) resolve({ data, mimeType });
-            else reject(new Error('Missing image data or mime type'));
-          });
-        });
-
-        const ext = imgData.mimeType.split('/')[1] || 'bin';
-        const fileName = sanitizeFilename(`${imgId}_${chapterTitle}.${ext}`);
-        const imagePath = path.join(IMAGES_DIR, fileName);
-
-        await fs.writeFile(imagePath, imgData.data);
-
-        imageInfos.push({
-          id: imgId,
-          fileName,
-          mimeType: imgData.mimeType,
-          size: imgData.data.length,
-        });
-      } catch (error) {
-        console.warn(`Failed to extract image ${imgId} from chapter ${chapterTitle}:`, error);
-      }
-    }
-  }
-
-  return imageInfos;
-};
-
-const processChapter = async (
-  epub: EPub,
-  chapter: EPubChapter,
-  position: number,
-  onProgress?: (progress: ProcessingProgress) => void,
-): Promise<ChapterInfo> => {
-  // Get chapter content
-  const [content, rawContent] = await Promise.all([
-    new Promise<string>((resolve, reject) => {
-      epub.getChapter(chapter.id, (err, text) => {
-        if (err) reject(new Error(`Failed to get chapter content: ${err.message}`));
-        else if (!text || !validateChapterContent(text)) {
-          reject(new Error(`Invalid chapter content for ${chapter.title}`));
-        } else resolve(text);
-      });
-    }),
-    new Promise<string>((resolve, reject) => {
-      epub.getChapterRaw(chapter.id, (err, text) => {
-        if (err) reject(new Error(`Failed to get raw chapter content: ${err.message}`));
-        else if (!text) reject(new Error(`Missing raw content for ${chapter.title}`));
-        else resolve(text);
-      });
-    }),
-  ]);
-
-  // Parse HTML content for metrics
-  const dom = new JSDOM(content);
-  const textContent = dom.window.document.body.textContent || '';
-  const words = textContent.trim().split(/\s+/).filter((w) => w.length > 0);
-  const paragraphs = content.match(/<p[^>]*>.*?<\/p>/gs) || [];
-
-  // Extract images
-  onProgress?.({
-    currentChapter: position,
-    totalChapters: epub.flow.length,
-    chapterTitle: chapter.title || 'Untitled',
-    status: 'extracting-images',
-  });
-
-  const images = await extractImages(epub, content, chapter.title || 'untitled');
-
-  const chapterInfo: ChapterInfo = {
-    id: chapter.id,
-    title: chapter.title || `Chapter ${position}`,
-    content: textContent,
-    rawContent,
-    wordCount: words.length,
-    charCount: textContent.length,
-    paragraphCount: paragraphs.length,
-    position,
-    fileName: sanitizeFilename(`chapter_${position.toString().padStart(3, '0')}_${chapter.title || 'untitled'}.txt`),
-    images,
-  };
-
-  return chapterInfo;
-};
-
-const processChaptersInBatches = async (
-  epub: EPub,
-  batchSize: number = 3,
-  onProgress?: (progress: ProcessingProgress) => void,
-): Promise<ChapterInfo[]> => {
-  const results: ChapterInfo[] = [];
-
-  for (let i = 0; i < epub.flow.length; i += batchSize) {
-    const batch = epub.flow.slice(i, i + batchSize);
-    const batchPromises = batch.map((chapter, idx) => processChapter(epub, chapter, i + idx + 1, onProgress));
-    const batchResults = await Promise.all(batchPromises);
-    results.push(...batchResults);
-  }
-
-  return results.sort((a, b) => a.position - b.position);
-};
-
-const extractChapters = async (
+export const extractChapters = async (
   epubPath: string,
   outputDir: string,
   onProgress?: (progress: ProcessingProgress) => void,
 ): Promise<void> => {
   try {
-    // Initialize EPUB
     const epub = await initializeEpub(epubPath);
-
-    // Create output directories
-    await fs.mkdir(outputDir, { recursive: true });
-    await fs.mkdir(IMAGES_DIR, { recursive: true });
-
-    // Extract TOC
-    await fs.writeFile(
-      path.join(outputDir, 'toc.json'),
-      JSON.stringify(epub.toc, null, 2),
-    );
-
-    // Process chapters in batches
     const chapters = await processChaptersInBatches(epub, 3, onProgress);
+    await writeFiles(epub, chapters, outputDir);
 
-    // Write chapter files and metadata
-    for (const chapter of chapters) {
-      onProgress?.({
-        currentChapter: chapter.position,
-        totalChapters: chapters.length,
-        chapterTitle: chapter.title,
-        status: 'writing-files',
-      });
-
-      const chapterPath = path.join(outputDir, chapter.fileName);
-      const metadataPath = path.join(outputDir, `${chapter.fileName}.meta.json`);
-
-      // Write chapter content
-      await fs.writeFile(chapterPath, chapter.content);
-
-      // Write metadata
-      const metadata: ChapterMetadata = {
-        id: chapter.id,
-        title: chapter.title,
-        wordCount: chapter.wordCount,
-        charCount: chapter.charCount,
-        paragraphCount: chapter.paragraphCount,
-        position: chapter.position,
-        fileName: chapter.fileName,
-        extractedDate: new Date().toISOString(),
-        images: chapter.images,
-      };
-
-      await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
-    }
-
-    // Write book metadata
-    const bookMetadata = {
-      title: epub.metadata.title,
-      author: epub.metadata.creator,
-      language: epub.metadata.language,
-      subject: epub.metadata.subject,
-      date: epub.metadata.date,
-      description: epub.metadata.description,
-      chapterCount: chapters.length,
-      totalWords: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
-      totalChars: chapters.reduce((sum, chapter) => sum + chapter.charCount, 0),
-      totalImages: chapters.reduce((sum, chapter) => sum + chapter.images.length, 0),
-      chapters: chapters.map((ch) => ({
-        title: ch.title,
-        fileName: ch.fileName,
-        position: ch.position,
-        imageCount: ch.images.length,
-      })),
-    };
-
-    await fs.writeFile(
-      path.join(outputDir, 'book_metadata.json'),
-      JSON.stringify(bookMetadata, null, 2),
-    );
-
+    // eslint-disable-next-line no-console
     console.log('Book processing complete!');
+    // eslint-disable-next-line no-console
     console.log(`Total chapters: ${chapters.length}`);
-    console.log(`Total words: ${bookMetadata.totalWords}`);
-    console.log(`Total images: ${bookMetadata.totalImages}`);
+    // eslint-disable-next-line no-console
+    console.log(`Total words: ${chapters.reduce((sum, ch) => sum + ch.wordCount, 0)}`);
+    // eslint-disable-next-line no-console
+    console.log(`Total images: ${chapters.reduce((sum, ch) => sum + ch.images.length, 0)}`);
+    // eslint-disable-next-line no-console
     console.log(`Output directory: ${outputDir}`);
   } catch (error) {
     throw new Error(`Failed to extract chapters: ${(error as Error).message}`);
   }
 };
 
-const processEpub = async (
+export const processEpub = async (
   onProgress?: (progress: ProcessingProgress) => void,
 ): Promise<void> => {
   try {
-    // Read input directory
     const files = await fs.readdir(INPUT_DIR);
     if (files.length === 0) {
       throw new Error('No files found in input directory');
     }
 
-    // Find first EPUB file
     const epubFile = files.find((file) => file.toLowerCase().endsWith('.epub'));
     if (!epubFile) {
       throw new Error('No EPUB files found in input directory');
@@ -340,9 +51,11 @@ const processEpub = async (
       throw new Error('Invalid EPUB file');
     }
 
+    // eslint-disable-next-line no-console
     console.log(`Processing EPUB file: ${epubFile}`);
     await extractChapters(epubPath, OUTPUT_DIR, onProgress);
   } catch (error) {
+    // eslint-disable-next-line no-console
     console.error('Error processing EPUB:', error);
     throw error;
   }
@@ -351,22 +64,18 @@ const processEpub = async (
 // CLI usage
 if (require.main === module) {
   void processEpub((progress) => {
+    // eslint-disable-next-line no-console
     console.log(
       `Processing ${progress.chapterTitle} (${progress.currentChapter}/${progress.totalChapters}) - ${progress.status}`,
     );
   })
+  // eslint-disable-next-line no-console
     .then(() => console.log('Processing complete!'))
     .catch((error) => {
+      // eslint-disable-next-line no-console
       console.error('Error during processing:', error);
       process.exit(1);
     });
 }
 
-export {
-  extractChapters,
-  processEpub,
-  type ChapterInfo,
-  type ChapterMetadata,
-  type ProcessingProgress,
-  type ImageInfo,
-};
+export * from './types/interfaces';
